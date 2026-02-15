@@ -1,0 +1,421 @@
+# -*- coding: utf-8 -*-
+"""
+从 info.tsv 更新 songlist.json：匹配曲目、对不存在的曲目提供曲包选择或创建新曲包，并智能生成 ID。
+"""
+
+import json
+import re
+import sys
+from pathlib import Path
+from datetime import date
+
+# Windows 控制台兼容：尽量使用 UTF-8 输出
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+
+def normalize_title(s: str) -> str:
+    """规范化标题便于匹配：空白字符统一为普通空格并去除首尾。"""
+    if not s:
+        return ""
+    s = " ".join(s.split())  # 任意空白（含 \xa0、全角空格）变为单个空格
+    return s.strip()
+
+
+def normalize_key(s: str) -> str:
+    """去掉符号与空格的 key，与 difficulty.tsv 风格一致，用于匹配。"""
+    if not s:
+        return ""
+    # 去掉空白、标点与下划线（含全角），只保留字母数字及 CJK，与 difficulty.tsv 风格一致
+    s = re.sub(r"[\s\u00a0\u3000\.,;:!?()\[\]&'\"～\-_]+", "", s)
+    s = re.sub(r"[\u3000-\u303f\uff00-\uffef]", "", s)  # 去掉全角标点等（如 ：）
+    s = re.sub(r"[^\w]", "", s, flags=re.UNICODE)  # 保留字母、数字、下划线、CJK
+    return s.lower()  # 不区分大小写，使 Re：birth 与 Re：Birth 等匹配
+
+
+def find_song_by_title(
+    title: str, title_to_song: dict, data: list, key_to_song: dict
+) -> tuple[int, dict] | None:
+    """通过规范化标题或 key（去符号空格）匹配 songlist 中的曲目，支持 key 前缀匹配。"""
+    norm = normalize_title(title)
+    if norm and norm in title_to_song:
+        return title_to_song[norm]
+    key = normalize_key(title)
+    if not key:
+        return None
+    if key in key_to_song:
+        return key_to_song[key]
+    # 前缀匹配：如 "The Mountain Eater" -> themountaineater 匹配 "The Mountain Eater from MUSYNC"
+    if len(key) >= 4:
+        for song in data:
+            sk = normalize_key(song.get("标题") or "")
+            if sk.startswith(key) or key.startswith(sk):
+                return (data.index(song), song)
+    return None
+
+
+def load_songlist(path: Path) -> tuple[list, dict, list, dict]:
+    """加载 songlist.json，返回 (data, title_to_song, packs_ordered, key_to_song)。"""
+    with open(path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    data = obj.get("data", [])
+    title_to_song = {}
+    key_to_song = {}
+    for i, song in enumerate(data):
+        title = normalize_title(song.get("标题") or "")
+        if title:
+            title_to_song[title] = (i, song)
+        key = normalize_key(song.get("标题") or "")
+        if key and key not in key_to_song:
+            key_to_song[key] = (i, song)
+        for alias in song.get("别称") or []:
+            a = normalize_title(alias or "")
+            if a and a not in title_to_song:
+                title_to_song[a] = (i, song)
+            ak = normalize_key(alias or "")
+            if ak and ak not in key_to_song:
+                key_to_song[ak] = (i, song)
+    packs_ordered = []
+    seen = set()
+    for song in data:
+        pack = song.get("曲包") or ""
+        if pack and pack not in seen:
+            seen.add(pack)
+            packs_ordered.append(pack)
+    return data, title_to_song, packs_ordered, key_to_song
+
+
+def pack_to_id_prefix(pack_name: str) -> str:
+    """将曲包显示名转为 ID 前缀（与现有规则一致：空格/连字符变下划线，合并连续下划线）。"""
+    s = (pack_name or "").strip()
+    s = re.sub(r"[\s\-]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s or "Pack"
+
+
+def last_index_of_pack(data: list, pack_name: str) -> int:
+    """返回 data 中该曲包最后一条的索引，若无则返回 -1。"""
+    last = -1
+    for i, song in enumerate(data):
+        if (song.get("曲包") or "") == pack_name:
+            last = i
+    return last
+
+
+def get_pack_prefix_and_next_num(data: list, pack_name: str) -> tuple[str, int]:
+    """根据 songlist 中该曲包已有 id 推断前缀与下一个序号。"""
+    prefix = pack_to_id_prefix(pack_name)
+    max_num = 0
+    for song in data:
+        if (song.get("曲包") or "") != pack_name:
+            continue
+        sid = song.get("id") or ""
+        m = re.match(r"^(.+)_(\d+)$", sid)
+        if m:
+            p, n = m.group(1), int(m.group(2))
+            if n > max_num:
+                max_num = n
+                prefix = p
+    return prefix, max_num + 1
+
+
+# difficulty.tsv 中因特殊符号被省略而与 songlist 无法匹配的曲目：
+# key: difficulty.tsv 中的 key（normalize_key 后）
+# value: 该曲目在 songlist 中对应的 keys（标题/别称 normalize_key 后）
+SPECIAL_DIFFICULTY_KEY_MAPPING = {
+    "slips": ["solips", "sølips"],  # sølips，别称 solips
+    "poseidon": ["ποσειδών"],  # Ποσειδών
+    "parsey": ["ρarsey"],  # ρars/ey
+}
+
+# 同名曲目需按 id 区分：key 为曲目 base key，value 为 [(difficulty 完整 key, id 需包含的子串), ...]
+# id 匹配时忽略大小写和 _/-，如 risingsun 可匹配 Chapter_Ex_Rising_Sun_Traxx_1
+SPECIAL_DIFFICULTY_ID_MAPPING = {
+    "anotherme": [
+        ("anotherme.neutralmoon", "risingsun"),  # Chapter Ex-Rising Sun Traxx
+        ("anotherme.daan", "kalpa"),  # Chapter Ex-KALPA
+    ],
+}
+
+
+def load_difficulty_tsv(path: Path) -> tuple[dict, set[str]]:
+    """
+    加载 difficulty.tsv：第一列为 曲目key.制谱者，后面 3 个或 4 个数字对应 ez, hd, in [, at]。
+    返回 (key -> {"ez", "hd", "in", "at"?}, 原始 key 集合)。
+    同一曲目多行时优先保留有 at 的那条。
+    使用 SPECIAL_DIFFICULTY_KEY_MAPPING 补充特殊曲目的 songlist 侧 key。
+    同名曲目（在 SPECIAL_DIFFICULTY_ID_MAPPING 中）使用 曲目.charter 作为 key 分别存储。
+    """
+    result = {}
+    original_keys = set()
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n\r")
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 4:
+                continue
+            full_col = parts[0]
+            split_full = full_col.split(".", 1)
+            title_part = split_full[0]
+            charter_part = split_full[1] if len(split_full) > 1 else ""
+            base_key = normalize_key(title_part)
+            full_key = f"{base_key}.{normalize_key(charter_part)}" if charter_part else base_key
+            if base_key in SPECIAL_DIFFICULTY_ID_MAPPING and charter_part:
+                key = full_key
+            else:
+                key = base_key
+            original_keys.add(key)
+            try:
+                ez, hd, in_val = float(parts[1]), float(parts[2]), float(parts[3])
+            except (ValueError, IndexError):
+                continue
+            at_val = None
+            if len(parts) >= 5:
+                try:
+                    at_val = float(parts[4])
+                except ValueError:
+                    pass
+            diff = {"ez": ez, "hd": hd, "in": in_val}
+            if at_val is not None:
+                diff["at"] = at_val
+            if key not in result or ("at" in diff and "at" not in result.get(key, {})):
+                result[key] = diff
+            for alias in SPECIAL_DIFFICULTY_KEY_MAPPING.get(key, []):
+                if alias not in result or ("at" in diff and "at" not in result.get(alias, {})):
+                    result[alias] = diff
+    return result, original_keys
+
+
+def find_difficulty_for_song(
+    song_title: str, difficulty_map: dict, data: list, song_id: str = ""
+) -> dict | None:
+    """根据曲目标题找到 difficulty_map 中对应的难度（key 或前缀匹配）。同名曲目通过 song_id 在 SPECIAL_DIFFICULTY_ID_MAPPING 中区分。"""
+    key = normalize_key(song_title or "")
+    if not key:
+        return None
+    if key in SPECIAL_DIFFICULTY_ID_MAPPING:
+        song_id_norm = (song_id or "").lower().replace("_", "").replace("-", "")
+        for full_key, id_substr in SPECIAL_DIFFICULTY_ID_MAPPING[key]:
+            if id_substr.lower().replace("_", "").replace("-", "") in song_id_norm:
+                if full_key in difficulty_map:
+                    return difficulty_map[full_key]
+                break
+    if key in difficulty_map:
+        return difficulty_map[key]
+    if len(key) >= 4:
+        for diff_key, diff_val in difficulty_map.items():
+            if "." in diff_key:
+                continue
+            if diff_key.startswith(key) or key.startswith(diff_key):
+                return diff_val
+    return None
+
+
+def apply_difficulties(
+    data: list, difficulty_map: dict, original_keys: set[str]
+) -> tuple[int, list[str], list[str]]:
+    """用 difficulty.tsv 的难度覆盖 songlist 中每条曲目的 难度，返回 (更新条数, 未匹配的 difficulty key 列表, 已更新的曲目标题列表)。"""
+    updated = 0
+    used_diff_ids = set()
+    updated_titles = []
+    for song in data:
+        song_id = song.get("id") or ""
+        diff = find_difficulty_for_song(
+            song.get("标题") or "", difficulty_map, data, song_id
+        )
+        if diff is None:
+            for alias in song.get("别称") or []:
+                diff = find_difficulty_for_song(
+                    alias or "", difficulty_map, data, song_id
+                )
+                if diff is not None:
+                    break
+        if diff is None:
+            continue
+        used_diff_ids.add(id(diff))
+        target = song.get("难度")
+        if not isinstance(target, dict):
+            song["难度"] = {}
+            target = song["难度"]
+        at_new = diff["at"] if "at" in diff else ""
+        at_old = target.get("at", "")
+        changed = (
+            target.get("ez") != diff["ez"]
+            or target.get("hd") != diff["hd"]
+            or target.get("in") != diff["in"]
+            or (at_old != at_new and (at_old or at_new))
+        )
+        target["ez"] = diff["ez"]
+        target["hd"] = diff["hd"]
+        target["in"] = diff["in"]
+        target["at"] = at_new
+        if changed:
+            updated += 1
+            updated_titles.append(song.get("标题") or "")
+    unmatched = [
+        k for k in sorted(original_keys)
+        if k in difficulty_map and id(difficulty_map[k]) not in used_diff_ids
+    ]
+    return updated, unmatched, updated_titles
+
+
+def load_info_tsv(path: Path) -> list[dict]:
+    """加载 info.tsv，每行：第一列 key，第二列标题，其余列保留。返回 [{"title": str, "row": list}, ...]"""
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n\r")
+            if not line:
+                continue
+            parts = line.split("\t")
+            title = (parts[1] if len(parts) > 1 else "").strip()
+            rows.append({"title": title, "row": parts})
+    return rows
+
+
+def new_song_entry(title: str, pack_name: str, new_id: str) -> dict:
+    """生成一条新曲目条目。"""
+    return {
+        "标题": title,
+        "bpm": 0,
+        "难度": {"ez": 0, "hd": 0, "in": 0, "at": 0},
+        "曲包": pack_name,
+        "攻略链接": {"ez": "", "hd": "", "in": "", "at": ""},
+        "id": new_id,
+        "别称": [],
+    }
+
+
+def main():
+    base = Path(__file__).resolve().parent
+    songlist_path = base / "songlist.json"
+    info_path = base / "info.tsv"
+
+    if not songlist_path.exists():
+        print(f"未找到 {songlist_path}")
+        return
+    if not info_path.exists():
+        print(f"未找到 {info_path}")
+        return
+
+    difficulty_path = base / "difficulty.tsv"
+    difficulty_map = {}
+    difficulty_original_keys = set()
+    if difficulty_path.exists():
+        difficulty_map, difficulty_original_keys = load_difficulty_tsv(difficulty_path)
+
+    data, title_to_song, packs_ordered, key_to_song = load_songlist(songlist_path)
+    info_rows = load_info_tsv(info_path)
+
+    missing = []
+    for rec in info_rows:
+        raw_title = rec["title"]
+        title = normalize_title(raw_title)
+        if not title:
+            continue
+        if find_song_by_title(title, title_to_song, data, key_to_song) is None:
+            rec["normalized_title"] = title
+            missing.append(rec)
+
+    new_entries = []
+    if missing:
+        for rec in missing:
+            print(f"  曲目: {rec.get('normalized_title', rec['title'])}")
+        print("\n曲包列表（按序号选择）：")
+        for idx, pack in enumerate(packs_ordered, start=1):
+            print(f"  {idx}. {pack}")
+        print("  0. 【创建新曲包】")
+        pack_choice_map = {str(i): packs_ordered[i - 1] for i in range(1, len(packs_ordered) + 1)}
+
+        for rec in missing:
+            title = rec.get("normalized_title", rec["title"])
+            while True:
+                try:
+                    choice = input(f"\n为「{title}」选择曲包序号 (0=新曲包): ").strip()
+                except EOFError:
+                    print("已跳过剩余曲目。")
+                    break
+                if choice == "0":
+                    pack_name = input("请输入新曲包名称: ").strip()
+                    if not pack_name:
+                        print("曲包名不能为空，请重试。")
+                        continue
+                    if pack_name not in packs_ordered:
+                        packs_ordered.append(pack_name)
+                        pack_choice_map[str(len(packs_ordered))] = pack_name
+                    prefix = pack_to_id_prefix(pack_name)
+                    existing_in_new = sum(1 for e in new_entries if e.get("曲包") == pack_name)
+                    next_num = existing_in_new + 1
+                    for s in data:
+                        if (s.get("曲包") or "") == pack_name:
+                            sid = s.get("id") or ""
+                            m = re.match(r"^.+_(\d+)$", sid)
+                            if m:
+                                next_num = max(next_num, int(m.group(1)) + 1)
+                    new_id = f"{prefix}_{next_num}"
+                    entry = new_song_entry(title, pack_name, new_id)
+                    new_entries.append(entry)
+                    last_i = last_index_of_pack(data, pack_name)
+                    if last_i >= 0:
+                        data.insert(last_i + 1, entry)
+                    else:
+                        data.append(entry)
+                    print(f"  已加入新曲包「{pack_name}」，ID: {new_id}")
+                    break
+                if choice in pack_choice_map:
+                    pack_name = pack_choice_map[choice]
+                    prefix, next_num = get_pack_prefix_and_next_num(data, pack_name)
+                    new_id = f"{prefix}_{next_num}"
+                    entry = new_song_entry(title, pack_name, new_id)
+                    new_entries.append(entry)
+                    last_i = last_index_of_pack(data, pack_name)
+                    data.insert(last_i + 1, entry)
+                    print(f"  已加入曲包「{pack_name}」，ID: {new_id}")
+                    break
+                print("无效序号，请重新输入。")
+    else:
+        print("info.tsv 中所有曲目均已在 songlist 中存在。")
+
+    updated_diff = 0
+    unmatched_diff_keys = []
+    updated_diff_titles = []
+    if difficulty_map:
+        updated_diff, unmatched_diff_keys, updated_diff_titles = apply_difficulties(
+            data, difficulty_map, difficulty_original_keys
+        )
+        if updated_diff > 0:
+            print(f"已从 difficulty.tsv 更新 {updated_diff} 首曲目的难度（ez/hd/in/at）：")
+            for t in updated_diff_titles:
+                print(f"  - {t}")
+        else:
+            print("难度已是最新，无需更新。")
+        if unmatched_diff_keys:
+            print(f"\n提醒：以下 difficulty.tsv 条目未匹配到 songlist 曲目，请检查拼写或添加到 SPECIAL_DIFFICULTY_KEY_MAPPING：")
+            for k in unmatched_diff_keys:
+                print(f"  - {k}")
+
+    if new_entries or updated_diff > 0:
+        out = {
+            "version": "1.0.0",
+            "lastUpdate": date.today().isoformat(),
+            "data": data,
+        }
+        with open(songlist_path, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=4)
+        parts = []
+        if new_entries:
+            parts.append(f"新增 {len(new_entries)} 首曲目")
+        if updated_diff > 0:
+            parts.append(f"更新 {updated_diff} 条难度")
+        print(f"\n已写回 songlist.json（{', '.join(parts)}）。")
+    elif not missing:
+        print("难度已是最新，未修改文件。")
+
+
+if __name__ == "__main__":
+    main()
