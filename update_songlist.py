@@ -29,8 +29,8 @@ def normalize_key(s: str) -> str:
     """去掉符号与空格的 key，与 difficulty.tsv 风格一致，用于匹配。"""
     if not s:
         return ""
-    # 去掉空白与标点（含全角），只保留字母数字及 CJK，与 difficulty.tsv 风格一致
-    s = re.sub(r"[\s\u00a0\u3000\.,;:!?()\[\]&'\"～\-]+", "", s)
+    # 去掉空白、标点与下划线（含全角），只保留字母数字及 CJK，与 difficulty.tsv 风格一致
+    s = re.sub(r"[\s\u00a0\u3000\.,;:!?()\[\]&'\"～\-_]+", "", s)
     s = re.sub(r"[\u3000-\u303f\uff00-\uffef]", "", s)  # 去掉全角标点等（如 ：）
     s = re.sub(r"[^\w]", "", s, flags=re.UNICODE)  # 保留字母、数字、下划线、CJK
     return s.lower()  # 不区分大小写，使 Re：birth 与 Re：Birth 等匹配
@@ -122,13 +122,25 @@ def get_pack_prefix_and_next_num(data: list, pack_name: str) -> tuple[str, int]:
     return prefix, max_num + 1
 
 
-def load_difficulty_tsv(path: Path) -> dict:
+# difficulty.tsv 中因特殊符号被省略而与 songlist 无法匹配的曲目：
+# key: difficulty.tsv 中的 key（normalize_key 后）
+# value: 该曲目在 songlist 中对应的 keys（标题/别称 normalize_key 后）
+SPECIAL_DIFFICULTY_KEY_MAPPING = {
+    "slips": ["solips", "sølips"],  # sølips，别称 solips
+    "poseidon": ["ποσειδών"],  # Ποσειδών
+    "parsey": ["ρarsey"],  # ρars/ey
+}
+
+
+def load_difficulty_tsv(path: Path) -> tuple[dict, set[str]]:
     """
     加载 difficulty.tsv：第一列为 曲目key.制谱者，后面 3 个或 4 个数字对应 ez, hd, in [, at]。
-    返回 key (normalize_key(曲目部分)) -> {"ez", "hd", "in", "at"?}。
+    返回 (key -> {"ez", "hd", "in", "at"?}, 原始 key 集合)。
     同一曲目多行时优先保留有 at 的那条。
+    使用 SPECIAL_DIFFICULTY_KEY_MAPPING 补充特殊曲目的 songlist 侧 key。
     """
     result = {}
+    original_keys = set()
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.rstrip("\n\r")
@@ -139,6 +151,7 @@ def load_difficulty_tsv(path: Path) -> dict:
                 continue
             title_part = parts[0].split(".", 1)[0]
             key = normalize_key(title_part)
+            original_keys.add(key)
             try:
                 ez, hd, in_val = float(parts[1]), float(parts[2]), float(parts[3])
             except (ValueError, IndexError):
@@ -154,7 +167,10 @@ def load_difficulty_tsv(path: Path) -> dict:
                 diff["at"] = at_val
             if key not in result or ("at" in diff and "at" not in result.get(key, {})):
                 result[key] = diff
-    return result
+            for alias in SPECIAL_DIFFICULTY_KEY_MAPPING.get(key, []):
+                if alias not in result or ("at" in diff and "at" not in result.get(alias, {})):
+                    result[alias] = diff
+    return result, original_keys
 
 
 def find_difficulty_for_song(song_title: str, difficulty_map: dict, data: list) -> dict | None:
@@ -171,13 +187,22 @@ def find_difficulty_for_song(song_title: str, difficulty_map: dict, data: list) 
     return None
 
 
-def apply_difficulties(data: list, difficulty_map: dict) -> int:
-    """用 difficulty.tsv 的难度覆盖 songlist 中每条曲目的 难度，返回更新条数。"""
+def apply_difficulties(
+    data: list, difficulty_map: dict, original_keys: set[str]
+) -> tuple[int, list[str]]:
+    """用 difficulty.tsv 的难度覆盖 songlist 中每条曲目的 难度，返回 (更新条数, 未匹配的 difficulty key 列表)。"""
     updated = 0
+    used_diff_ids = set()
     for song in data:
         diff = find_difficulty_for_song(song.get("标题") or "", difficulty_map, data)
         if diff is None:
+            for alias in song.get("别称") or []:
+                diff = find_difficulty_for_song(alias or "", difficulty_map, data)
+                if diff is not None:
+                    break
+        if diff is None:
             continue
+        used_diff_ids.add(id(diff))
         target = song.get("难度")
         if not isinstance(target, dict):
             song["难度"] = {}
@@ -190,7 +215,11 @@ def apply_difficulties(data: list, difficulty_map: dict) -> int:
         else:
             target["at"] = ""
         updated += 1
-    return updated
+    unmatched = [
+        k for k in sorted(original_keys)
+        if k in difficulty_map and id(difficulty_map[k]) not in used_diff_ids
+    ]
+    return updated, unmatched
 
 
 def load_info_tsv(path: Path) -> list[dict]:
@@ -234,8 +263,9 @@ def main():
 
     difficulty_path = base / "difficulty.tsv"
     difficulty_map = {}
+    difficulty_original_keys = set()
     if difficulty_path.exists():
-        difficulty_map = load_difficulty_tsv(difficulty_path)
+        difficulty_map, difficulty_original_keys = load_difficulty_tsv(difficulty_path)
 
     data, title_to_song, packs_ordered, key_to_song = load_songlist(songlist_path)
     info_rows = load_info_tsv(info_path)
@@ -310,9 +340,16 @@ def main():
         print("info.tsv 中所有曲目均已在 songlist 中存在。")
 
     updated_diff = 0
+    unmatched_diff_keys = []
     if difficulty_map:
-        updated_diff = apply_difficulties(data, difficulty_map)
+        updated_diff, unmatched_diff_keys = apply_difficulties(
+            data, difficulty_map, difficulty_original_keys
+        )
         print(f"已从 difficulty.tsv 更新 {updated_diff} 首曲目的难度（ez/hd/in/at）。")
+        if unmatched_diff_keys:
+            print(f"\n提醒：以下 difficulty.tsv 条目未匹配到 songlist 曲目，请检查拼写或添加到 SPECIAL_DIFFICULTY_KEY_MAPPING：")
+            for k in unmatched_diff_keys:
+                print(f"  - {k}")
 
     if new_entries or updated_diff > 0:
         out = {
