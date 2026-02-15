@@ -189,10 +189,11 @@ def find_difficulty_for_song(song_title: str, difficulty_map: dict, data: list) 
 
 def apply_difficulties(
     data: list, difficulty_map: dict, original_keys: set[str]
-) -> tuple[int, list[str]]:
-    """用 difficulty.tsv 的难度覆盖 songlist 中每条曲目的 难度，返回 (更新条数, 未匹配的 difficulty key 列表)。"""
+) -> tuple[int, list[str], list[str]]:
+    """用 difficulty.tsv 的难度覆盖 songlist 中每条曲目的 难度，返回 (更新条数, 未匹配的 difficulty key 列表, 已更新的曲目标题列表)。"""
     updated = 0
     used_diff_ids = set()
+    updated_titles = []
     for song in data:
         diff = find_difficulty_for_song(song.get("标题") or "", difficulty_map, data)
         if diff is None:
@@ -215,11 +216,12 @@ def apply_difficulties(
         else:
             target["at"] = ""
         updated += 1
+        updated_titles.append(song.get("标题") or "")
     unmatched = [
         k for k in sorted(original_keys)
         if k in difficulty_map and id(difficulty_map[k]) not in used_diff_ids
     ]
-    return updated, unmatched
+    return updated, unmatched, updated_titles
 
 
 def load_info_tsv(path: Path) -> list[dict]:
@@ -341,11 +343,15 @@ def main():
 
     updated_diff = 0
     unmatched_diff_keys = []
+    updated_diff_titles = []
     if difficulty_map:
-        updated_diff, unmatched_diff_keys = apply_difficulties(
+        updated_diff, unmatched_diff_keys, updated_diff_titles = apply_difficulties(
             data, difficulty_map, difficulty_original_keys
         )
         print(f"已从 difficulty.tsv 更新 {updated_diff} 首曲目的难度（ez/hd/in/at）。")
+        if updated_diff_titles:
+            for t in updated_diff_titles:
+                print(f"  - {t}")
         if unmatched_diff_keys:
             print(f"\n提醒：以下 difficulty.tsv 条目未匹配到 songlist 曲目，请检查拼写或添加到 SPECIAL_DIFFICULTY_KEY_MAPPING：")
             for k in unmatched_diff_keys:
